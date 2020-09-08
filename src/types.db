@@ -271,6 +271,8 @@ vcl                     value:GAUGE:0:65535
 vcpu                    value:GAUGE:0:U
 virt_cpu_total          value:DERIVE:0:U
 virt_vcpu               value:DERIVE:0:U
+virt_vcpu_steal         value:DERIVE:0:U
+virt_vcpu_guest_avg     value:DERIVE:0:U
 vmpage_action           value:DERIVE:0:U
 vmpage_faults           minflt:DERIVE:0:U, majflt:DERIVE:0:U
 vmpage_io               in:DERIVE:0:U, out:DERIVE:0:U

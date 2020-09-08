@@ -1003,14 +1003,6 @@ static void cpu_submit(const domain_t *dom, unsigned long long cpuTime_new) {
          1);
 }
 
-static void vcpu_submit(derive_t value, virDomainPtr dom, int vcpu_nr,
-                        const char *type) {
-  char type_instance[DATA_MAX_NAME_LEN];
-
-  ssnprintf(type_instance, sizeof(type_instance), "%d", vcpu_nr);
-  submit(dom, type, type_instance, &(value_t){.derive = value}, 1);
-}
-
 static void disk_block_stats_submit(struct lv_block_stats *bstats,
                                     virDomainPtr dom, const char *dev,
                                     virDomainBlockInfoPtr binfo) {
@@ -1596,14 +1588,8 @@ static void vcpu_pin_submit(virDomainPtr dom, int max_cpus, int vcpu,
   }
 }
 
-static int get_vcpu_stats(virDomainPtr domain, unsigned short nr_virt_cpu) {
+static int get_vcpu_pin(virDomainPtr domain, unsigned short nr_virt_cpu) {
   int max_cpus = VIR_NODEINFO_MAXCPUS(nodeinfo);
-
-  virVcpuInfoPtr vinfo = calloc(nr_virt_cpu, sizeof(*vinfo));
-  if (vinfo == NULL) {
-    ERROR(PLUGIN_NAME " plugin: calloc failed.");
-    return -1;
-  }
 
   int cpu_map_len = 0;
   unsigned char *cpumaps = NULL;
@@ -1613,42 +1599,86 @@ static int get_vcpu_stats(virDomainPtr domain, unsigned short nr_virt_cpu) {
 
     if (cpumaps == NULL) {
       ERROR(PLUGIN_NAME " plugin: calloc failed.");
-      sfree(vinfo);
       return -1;
     }
   }
 
   int status =
-      virDomainGetVcpus(domain, vinfo, nr_virt_cpu, cpumaps, cpu_map_len);
+      virDomainGetVcpuPinInfo(domain, nr_virt_cpu, cpumaps, cpu_map_len, 0);
   if (status < 0) {
-    ERROR(PLUGIN_NAME " plugin: virDomainGetVcpus failed with status %i.",
+    ERROR(PLUGIN_NAME " plugin: virDomainGetVcpuPinInfo failed with status %i.",
           status);
 
     virErrorPtr err = virGetLastError();
     if (err->code == VIR_ERR_NO_SUPPORT) {
-      if (extra_stats & ex_stats_vcpu)
-        ERROR(PLUGIN_NAME
-              " plugin: Disabled unsupported ExtraStats selector: vcpu");
       if (extra_stats & ex_stats_vcpupin)
         ERROR(PLUGIN_NAME
               " plugin: Disabled unsupported ExtraStats selector: vcpupin");
-      extra_stats &= ~(ex_stats_vcpu | ex_stats_vcpupin);
+      extra_stats &= ~ex_stats_vcpupin;
     }
 
     sfree(cpumaps);
-    sfree(vinfo);
     return -1;
   }
 
-  for (int i = 0; i < nr_virt_cpu; ++i) {
-    if (extra_stats & ex_stats_vcpu)
-      vcpu_submit(vinfo[i].cpuTime, domain, vinfo[i].number, "virt_vcpu");
+  for (int i = 0; i < nr_virt_cpu; ++i)
     if (extra_stats & ex_stats_vcpupin)
       vcpu_pin_submit(domain, max_cpus, i, cpumaps, cpu_map_len);
-  }
 
   sfree(cpumaps);
-  sfree(vinfo);
+  return 0;
+}
+
+static int get_vcpu_time(virDomainPtr domain, unsigned short nr_virt_cpu) {
+  virDomainStatsRecordPtr *stats = NULL;
+  /* virDomainListGetStats requires a NULL terminated list of domains */
+  virDomainPtr domain_array[] = {domain, NULL};
+  unsigned long long vcpu_time_guest = 0;
+
+  /* VIR_DOMAIN_STATS_VCPU */
+  int status = virDomainListGetStats(domain_array, 8, &stats, 0);
+  if (status == -1) {
+    ERROR(PLUGIN_NAME " plugin: virDomainListGetStats failed with status %i.",
+          status);
+
+    virErrorPtr err = virGetLastError();
+    if (err->code == VIR_ERR_NO_SUPPORT) {
+      ERROR(PLUGIN_NAME
+            " plugin: Disabled unsupported ExtraStats selector: vcpu");
+      extra_stats &= ~ex_stats_vcpu;
+    }
+
+    return -1;
+  }
+
+  /* there is only one domain */
+  virDomainStatsRecordPtr st = stats[0];
+  for (int i = 0; i < st->nparams; ++i) {
+    char type_instance[DATA_MAX_NAME_LEN];
+    char metric[DATA_MAX_NAME_LEN];
+    int vcpu_idx;
+
+
+    /* only report time and wait (steal) value */
+    if (sscanf(st->params[i].field, "vcpu.%d.%s", &vcpu_idx, metric) != 2)
+      continue;
+
+    ssnprintf(type_instance, sizeof(type_instance), "%d", vcpu_idx);
+    vcpu_time_guest += st->params[i].value.ul;
+
+
+    if(strcmp(metric, "wait") == 0)
+      submit(st->dom, "virt_vcpu_steal", type_instance,
+            &(value_t){.derive = st->params[i].value.ul}, 1);
+    else if (strcmp(metric, "time") == 0)
+      submit(st->dom, "virt_vcpu", type_instance,
+            &(value_t){.derive = st->params[i].value.ul}, 1);
+  }
+
+  submit(st->dom, "virt_vcpu_guest_avg", NULL,
+            &(value_t){.derive = vcpu_time_guest/nr_virt_cpu}, 1);
+
+  virDomainStatsRecordListFree(stats);
   return 0;
 }
 
@@ -2115,8 +2145,10 @@ static int get_domain_metrics(domain_t *domain) {
 
   memory_submit(domain->ptr, (gauge_t)info.memory * 1024);
 
-  if (extra_stats & (ex_stats_vcpu | ex_stats_vcpupin))
-    GET_STATS(get_vcpu_stats, "vcpu stats", domain->ptr, info.nrVirtCpu);
+  if (extra_stats & ex_stats_vcpu)
+    GET_STATS(get_vcpu_time, "vcpu time", domain->ptr, info.nrVirtCpu);
+  if (extra_stats & ex_stats_vcpupin)
+    GET_STATS(get_vcpu_pin, "vcpu pin", domain->ptr, info.nrVirtCpu);
   if (extra_stats & ex_stats_memory)
     GET_STATS(get_memory_stats, "memory stats", domain->ptr);
 
